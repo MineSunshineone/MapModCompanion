@@ -52,7 +52,8 @@ public class MapModCompanion extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        scheduler.schedule(this::unload);
+        // Call unload directly - cannot schedule tasks when plugin is being disabled
+        unload();
         fileChangeWatchdogScheduler.shutdown();
         scheduler.cleanUp();
     }
