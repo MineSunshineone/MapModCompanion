@@ -7,23 +7,27 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
-import org.bukkit.event.player.PlayerChangedWorldEvent;
-import org.bukkit.event.player.PlayerEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 
 import java.util.Arrays;
-import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 public class XaeroHandler implements Handler, Listener {
     private static final long TICKS_PER_SECOND = 20L;
+    private static final long POLL_INTERVAL_TICKS = TICKS_PER_SECOND * 3; // Poll every 3 seconds
 
     private final Logger logger;
     private final String configPath;
     private final String channelName;
     private final MapModCompanion plugin;
     private final PluginScheduler scheduler;
+
+    // Track each player's last known world UUID
+    private final Map<UUID, UUID> playerWorldMap = new ConcurrentHashMap<>();
 
     public XaeroHandler(Logger logger, String configPath, String channelName, MapModCompanion plugin,
             PluginScheduler scheduler) {
@@ -44,59 +48,86 @@ public class XaeroHandler implements Handler, Listener {
     public void cleanUp() {
         plugin.unregisterOutgoingChannel(channelName);
         HandlerList.unregisterAll(this);
+        playerWorldMap.clear();
         logger.fine("Event listener has been unregistered");
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerJoined(PlayerJoinEvent event) {
-        sendPacket(event, Type.JOIN);
+        Player player = event.getPlayer();
+        World world = player.getWorld();
+
+        // Record initial world
+        playerWorldMap.put(player.getUniqueId(), world.getUID());
+
+        // Send initial packet immediately
+        sendWorldPacket(player, world);
+
+        // Send additional packets with delay (client may not be ready immediately)
+        scheduler.scheduleForEntityDelayed(player, () -> sendWorldPacket(player, player.getWorld()), TICKS_PER_SECOND);
+        scheduler.scheduleForEntityDelayed(player, () -> sendWorldPacket(player, player.getWorld()),
+                TICKS_PER_SECOND * 2);
+
+        // Start polling task for this player
+        startPollingTask(player);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
-    public void onWorldChanged(PlayerChangedWorldEvent event) {
-        sendPacket(event, Type.WORLD_CHANGE);
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        // Clean up player's world tracking
+        playerWorldMap.remove(event.getPlayer().getUniqueId());
     }
 
-    private void sendPacket(PlayerEvent event, Type type) {
-        Player p = event.getPlayer();
-        World world = p.getWorld();
-        int id = plugin.getRegistry().getId(world);
-        byte[] payload = LevelMapProperties.Serializer.instance().serialize(id);
-        UUID expectedWorld = world.getUID();
+    /**
+     * Start a recurring polling task for the player to detect world changes.
+     * This runs on the entity's region thread and schedules itself repeatedly.
+     */
+    private void startPollingTask(Player player) {
+        scheduler.scheduleForEntityDelayed(player, () -> pollPlayerWorld(player), POLL_INTERVAL_TICKS);
+    }
 
-        int repeatTimes = plugin.getConfig().getInt(
-                configPath + ".events." + type.name().toLowerCase(Locale.ROOT) + ".repeat_times",
-                1);
-
-        for (int i = 0; i < repeatTimes; i++) {
-            long delayTicks = i * TICKS_PER_SECOND;
-            if (delayTicks == 0) {
-                // Run immediately on entity's thread
-                scheduler.scheduleForEntity(p, () -> sendPayload(p, expectedWorld, payload));
-            } else {
-                // Run delayed on entity's thread
-                scheduler.scheduleForEntityDelayed(p, () -> sendPayload(p, expectedWorld, payload), delayTicks);
-            }
+    /**
+     * Check if the player's world has changed since last check.
+     * If changed, send the world packet and update tracking.
+     * Then reschedule itself.
+     */
+    private void pollPlayerWorld(Player player) {
+        if (!player.isOnline()) {
+            playerWorldMap.remove(player.getUniqueId());
+            return;
         }
+
+        UUID playerUUID = player.getUniqueId();
+        World currentWorld = player.getWorld();
+        UUID currentWorldUID = currentWorld.getUID();
+        UUID lastKnownWorldUID = playerWorldMap.get(playerUUID);
+
+        if (lastKnownWorldUID == null || !lastKnownWorldUID.equals(currentWorldUID)) {
+            // World changed! Send packet and update tracking
+            logger.fine("Detected world change for " + player.getName() + ": " +
+                    (lastKnownWorldUID != null ? lastKnownWorldUID : "null") + " -> " + currentWorldUID);
+            playerWorldMap.put(playerUUID, currentWorldUID);
+            sendWorldPacket(player, currentWorld);
+        }
+
+        // Reschedule the polling task
+        scheduler.scheduleForEntityDelayed(player, () -> pollPlayerWorld(player), POLL_INTERVAL_TICKS);
     }
 
-    private void sendPayload(Player player, UUID expectedWorld, byte[] payload) {
+    /**
+     * Send the world ID packet to the player.
+     */
+    private void sendWorldPacket(Player player, World world) {
         if (!player.isOnline()) {
             return;
         }
-        UUID currentWorld = player.getWorld().getUID();
-        if (!currentWorld.equals(expectedWorld)) {
-            logger.fine("Skipping sending Xaero's LevelMapProperties to " + player.getName() + ": unexpected world");
-            return;
-        }
+
+        int id = plugin.getRegistry().getId(world);
+        byte[] payload = LevelMapProperties.Serializer.instance().serialize(id);
+
         logger.fine(
                 () -> "Sending Xaero's LevelMapProperties to " + player.getName() + ": " + Arrays.toString(payload));
         player.sendPluginMessage(plugin, channelName, payload);
-    }
-
-    private enum Type {
-        JOIN,
-        WORLD_CHANGE,
     }
 
     public static class Factory implements Handler.Factory<MapModCompanion> {
