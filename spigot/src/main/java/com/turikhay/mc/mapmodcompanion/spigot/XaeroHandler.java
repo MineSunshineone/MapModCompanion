@@ -14,27 +14,24 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 public class XaeroHandler implements Handler, Listener {
+    private static final long TICKS_PER_SECOND = 20L;
+
     private final Logger logger;
     private final String configPath;
     private final String channelName;
     private final MapModCompanion plugin;
-    private final ScheduledExecutorService scheduler;
+    private final PluginScheduler scheduler;
 
-    public XaeroHandler(Logger logger, String configPath, String channelName, MapModCompanion plugin) {
+    public XaeroHandler(Logger logger, String configPath, String channelName, MapModCompanion plugin,
+            PluginScheduler scheduler) {
         this.logger = logger;
         this.configPath = configPath;
         this.channelName = channelName;
         this.plugin = plugin;
-
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(
-                new DaemonThreadFactory(ILogger.ofJava(logger), XaeroHandler.class)
-        );
+        this.scheduler = scheduler;
     }
 
     public void init() throws InitializationException {
@@ -48,7 +45,6 @@ public class XaeroHandler implements Handler, Listener {
         plugin.unregisterOutgoingChannel(channelName);
         HandlerList.unregisterAll(this);
         logger.fine("Event listener has been unregistered");
-        scheduler.shutdown();
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -66,18 +62,36 @@ public class XaeroHandler implements Handler, Listener {
         World world = p.getWorld();
         int id = plugin.getRegistry().getId(world);
         byte[] payload = LevelMapProperties.Serializer.instance().serialize(id);
-        SendPayloadTask task = new SendPayloadTask(logger, plugin, p.getUniqueId(), channelName, payload, world.getUID());
+        UUID expectedWorld = world.getUID();
+
         int repeatTimes = plugin.getConfig().getInt(
                 configPath + ".events." + type.name().toLowerCase(Locale.ROOT) + ".repeat_times",
-                1
-        );
-        if (repeatTimes > 1) {
-            for (int i = 0; i < repeatTimes; i++) {
-                scheduler.schedule(task, i, TimeUnit.SECONDS);
+                1);
+
+        for (int i = 0; i < repeatTimes; i++) {
+            long delayTicks = i * TICKS_PER_SECOND;
+            if (delayTicks == 0) {
+                // Run immediately on entity's thread
+                scheduler.scheduleForEntity(p, () -> sendPayload(p, expectedWorld, payload));
+            } else {
+                // Run delayed on entity's thread
+                scheduler.scheduleForEntityDelayed(p, () -> sendPayload(p, expectedWorld, payload), delayTicks);
             }
-        } else {
-            task.run();
         }
+    }
+
+    private void sendPayload(Player player, UUID expectedWorld, byte[] payload) {
+        if (!player.isOnline()) {
+            return;
+        }
+        UUID currentWorld = player.getWorld().getUID();
+        if (!currentWorld.equals(expectedWorld)) {
+            logger.fine("Skipping sending Xaero's LevelMapProperties to " + player.getName() + ": unexpected world");
+            return;
+        }
+        logger.fine(
+                () -> "Sending Xaero's LevelMapProperties to " + player.getName() + ": " + Arrays.toString(payload));
+        player.sendPluginMessage(plugin, channelName, payload);
     }
 
     private enum Type {
@@ -88,10 +102,12 @@ public class XaeroHandler implements Handler, Listener {
     public static class Factory implements Handler.Factory<MapModCompanion> {
         private final String configPath;
         private final String channelName;
+        private final PluginScheduler scheduler;
 
-        public Factory(String configPath, String channelName) {
+        public Factory(String configPath, String channelName, PluginScheduler scheduler) {
             this.configPath = configPath;
             this.channelName = channelName;
+            this.scheduler = scheduler;
         }
 
         @Override
@@ -104,44 +120,9 @@ public class XaeroHandler implements Handler, Listener {
             plugin.checkEnabled(configPath);
             XaeroHandler handler = new XaeroHandler(
                     new PrefixLogger(plugin.getVerboseLogger(), channelName),
-                    configPath, channelName, plugin
-            );
+                    configPath, channelName, plugin, scheduler);
             handler.init();
             return handler;
-        }
-    }
-
-    private static class SendPayloadTask implements Runnable {
-        private final Logger logger;
-        private final MapModCompanion plugin;
-        private final UUID playerId;
-        private final String channelName;
-        private final byte[] payload;
-        private final UUID expectedWorld;
-
-        public SendPayloadTask(Logger logger, MapModCompanion plugin, UUID playerId, String channelName, byte[] payload,
-                               UUID expectedWorld) {
-            this.logger = logger;
-            this.plugin = plugin;
-            this.playerId = playerId;
-            this.channelName = channelName;
-            this.payload = payload;
-            this.expectedWorld = expectedWorld;
-        }
-
-        @Override
-        public void run() {
-            Player player = plugin.getServer().getPlayer(playerId);
-            if (player == null) {
-                return;
-            }
-            UUID world = player.getWorld().getUID();
-            if (!world.equals(expectedWorld)) {
-                logger.fine("Skipping sending Xaero's LevelMapProperties to " + player.getName() + ": unexpected world");
-                return;
-            }
-            logger.fine(() -> "Sending Xaero's LevelMapProperties to " + player.getName() + ": " + Arrays.toString(payload));
-            player.sendPluginMessage(plugin, channelName, payload);
         }
     }
 }

@@ -16,27 +16,6 @@ import java.util.concurrent.ScheduledExecutorService;
 public class MapModCompanion extends JavaPlugin {
     private static final int BSTATS_ID = 16539;
 
-    private final List<Handler.Factory<MapModCompanion>> factories = Arrays.asList(
-            new XaeroHandler.Factory(
-                    "xaero.mini_map",
-                    Channels.XAERO_MINIMAP_CHANNEL
-            ),
-            new XaeroHandler.Factory(
-                    "xaero.world_map",
-                    Channels.XAERO_WORLDMAP_CHANNEL
-            ),
-            new LevelIdHandler.Factory(
-                    "world_id.modern",
-                    Channels.WORLDID_CHANNEL,
-                    false
-            ),
-            new LevelIdHandler.Factory(
-                    "world_id.legacy",
-                    Channels.WORLDID_LEGACY_CHANNEL,
-                    true
-            )
-    );
-
     private VerboseLogger logger;
     private PluginScheduler scheduler;
     private ScheduledExecutorService fileChangeWatchdogScheduler;
@@ -88,13 +67,31 @@ public class MapModCompanion extends JavaPlugin {
 
         registry = initRegistry();
         protocolLib = Handler.initialize(logger, this, new ProtocolLib.Factory());
+
+        // Build factories with scheduler dependency
+        List<Handler.Factory<MapModCompanion>> factories = Arrays.asList(
+                new XaeroHandler.Factory(
+                        "xaero.mini_map",
+                        Channels.XAERO_MINIMAP_CHANNEL,
+                        scheduler),
+                new XaeroHandler.Factory(
+                        "xaero.world_map",
+                        Channels.XAERO_WORLDMAP_CHANNEL,
+                        scheduler),
+                new LevelIdHandler.Factory(
+                        "world_id.modern",
+                        Channels.WORLDID_CHANNEL,
+                        false),
+                new LevelIdHandler.Factory(
+                        "world_id.legacy",
+                        Channels.WORLDID_LEGACY_CHANNEL,
+                        true));
         handlers = Handler.initialize(logger, this, factories);
         fileChangeWatchdog = new FileChangeWatchdog(
                 logger,
                 fileChangeWatchdogScheduler,
                 getDataFolder().toPath().resolve("config.yml"),
-                () -> scheduler.schedule(this::reload)
-        );
+                () -> scheduler.schedule(this::reload));
         fileChangeWatchdog.start();
     }
 
@@ -115,7 +112,13 @@ public class MapModCompanion extends JavaPlugin {
         PluginScheduler selected;
         if (FoliaSupport.isFoliaServer()) {
             logger.info("Folia server support enabled");
-            selected = new SingleThreadScheduler(ILogger.ofJava(logger));
+            try {
+                selected = new FoliaScheduler(this, ILogger.ofJava(logger));
+            } catch (ReflectiveOperationException e) {
+                logger.warning("Failed to initialize FoliaScheduler, falling back to SingleThreadScheduler: "
+                        + e.getMessage());
+                selected = new SingleThreadScheduler(ILogger.ofJava(logger));
+            }
         } else {
             selected = new BukkitScheduler(this);
         }
@@ -139,8 +142,7 @@ public class MapModCompanion extends JavaPlugin {
         registry = new IdRegistry.ConvertingRegistry(
                 logger,
                 new IdLookup.ConfigBased((path, def) -> getConfig().getInt(path, def)),
-                registry
-        );
+                registry);
         return new IdRegistry.CacheableRegistry(registry);
     }
 
@@ -183,7 +185,8 @@ public class MapModCompanion extends JavaPlugin {
         getServer().getMessenger().unregisterOutgoingPluginChannel(this, channelName);
     }
 
-    void registerIncomingChannel(String channelName, boolean legacyChannel, PluginMessageListener listener) throws InitializationException {
+    void registerIncomingChannel(String channelName, boolean legacyChannel, PluginMessageListener listener)
+            throws InitializationException {
         logger.fine("Registering incoming plugin channel: " + channelName);
         try {
             getServer().getMessenger().registerIncomingPluginChannel(this, channelName, listener);
